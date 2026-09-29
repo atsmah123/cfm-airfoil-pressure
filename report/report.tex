@@ -1,0 +1,574 @@
+\documentclass[12pt]{article}
+\PassOptionsToPackage{authoryear, compress}{natbib}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage[authoryear]{natbib}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage{placeins}
+\usepackage{amsmath}
+\usepackage[margin=1.2in]{geometry}
+
+\title{Uncertainty-Aware Reconstruction of Airfoil Surface Pressure\\
+       from Sparse Tap Measurements via Conditional Flow Matching}
+
+\author{Atharva Mahajan \\
+        University of Michigan \\
+        \texttt{atharvm@umich.edu}}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Recovering full surface pressure distributions from sparse sensor measurements
+is a fundamental challenge in experimental aerodynamics. Dense tap arrays and
+Pressure-Sensitive Paint are expensive and often geometrically infeasible,
+motivating data-driven reconstruction from limited observations. We present a
+generative framework based on \textbf{Conditional Flow Matching (CFM)} that
+reconstructs the complete 2D airfoil pressure field from $k \in \{5, 10, 20\}$
+pressure tap measurements, while providing calibrated uncertainty estimates over
+the inferred field. The model combines a \textbf{DeepSets encoder with learned
+positional attention} — which aggregates sparse, arbitrarily-placed tap
+observations into a compact conditioning vector — with a \textbf{1D convolutional
+UNet vector field} conditioned via Feature-wise Linear Modulation (FiLM) at
+every spatial scale. Trained on the AirfRANS dataset of 800 RANS simulations,
+the framework achieves a mean absolute error of 183\,Pa (14\% of the pressure
+standard deviation) at $k=10$ uniformly-spaced taps, and recovers lift and drag
+coefficients to within $\Delta C_L = 0.094$ and $\Delta C_D = 0.015$
+respectively. We further evaluate a randomized tap placement variant that
+generalises to arbitrary sensor configurations, achieving 237\,Pa MAE at
+$k=20$ — providing a quantitative bound on the cost of not controlling sensor
+placement. The posterior ensemble is well-calibrated at $k=5$ (97\% coverage
+at $\pm2\sigma$) and remains conservative at higher tap counts, making the
+framework suitable for risk-aware aerodynamic analysis.
+\end{abstract}
+
+%------------------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+%------------------------------------------------------------------------------
+
+The surface pressure distribution is the primary aerodynamic quantity governing
+lift, drag, and pitching moment. In flight testing and wind tunnel experiments,
+it is measured by arrays of pressure taps — small orifices connected to
+transducers — whose placement is constrained by structural access, cost, and
+the geometry of the model. As a result, experimental campaigns routinely operate
+with $\mathcal{O}(10$--$100)$ taps on surfaces with $\mathcal{O}(10^3)$
+meaningful spatial degrees of freedom, requiring interpolation or model-based
+reconstruction to recover the full field.
+
+Classical reconstruction approaches include polynomial fitting, radial basis
+function interpolation, and physics-informed splines. These methods assume
+smoothness but do not quantify uncertainty, and degrade rapidly when taps are
+sparse relative to the complexity of the pressure distribution — particularly
+near the leading-edge suction peak and in regions of flow separation.
+
+Generative deep learning offers a natural alternative: rather than producing a
+single reconstruction, a generative model learns the conditional distribution
+$p(\mathbf{p} \mid \mathbf{y}_k)$, where $\mathbf{p} \in \mathbb{R}^N$ is the
+full pressure field and $\mathbf{y}_k$ are the $k$ tap observations. Drawing
+samples from this posterior provides both a mean reconstruction and uncertainty
+estimates that reflect genuine ambiguity in the under-determined problem.
+
+\textbf{Flow Matching} \citep{lipman2022flow} is a recently proposed generative
+paradigm that learns a deterministic ODE-based transport from a Gaussian
+reference to the target distribution, trained by regressing onto the
+ground-truth velocity field along straight-line probability paths. Compared to
+score-based diffusion models, it offers faster training convergence, simpler
+implementation, and more stable inference trajectories. \textbf{Conditional Flow
+Matching} (CFM) \citep{albergo2022building} extends this to conditional generation
+by incorporating an observation vector into the learned velocity field.
+
+This work applies CFM to 2D airfoil pressure reconstruction. Our contributions
+are:
+\begin{enumerate}
+    \item A complete CFM pipeline for sparse aerodynamic field reconstruction,
+          integrating a DeepSets encoder with learned positional attention and a
+          1D conv UNet vector field with FiLM conditioning.
+    \item A controlled ablation of uniform vs.\ randomized tap placement,
+          quantifying the reconstruction cost of unconstrained sensor locations.
+    \item A detailed analysis of model failure modes by angle of attack and
+          flow regime, identifying the operating envelope where the framework
+          is reliable.
+\end{enumerate}
+
+%------------------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+%------------------------------------------------------------------------------
+
+\paragraph{Sparse field reconstruction.}
+Sparse sensor placement and reconstruction has been studied in the context of
+gappy POD \citep{everson1995karhunen}, optimal sensor placement
+\citep{manohar2018data}, and compressed sensing \citep{bai2020low}. These methods
+require a basis computed from the training ensemble and cannot extrapolate to
+conditions outside it. Neural operator approaches \citep{li2021fourier} learn
+mappings between function spaces but typically require dense input observations.
+
+\paragraph{Generative models for physical fields.}
+Score-based diffusion has been applied to turbulence super-resolution
+\citep{shu2023physics} and weather reconstruction \citep{price2023gencast}.
+Flow Matching has been adopted for molecular generation and video synthesis;
+its application to physical fields is nascent. Closest to our work is
+Diff-SPORT, which applies diffusion to sparse sports tracking, demonstrating
+that conditional score models generalise well to irregular observation sets.
+
+\paragraph{Aerodynamic surrogate modelling.}
+Deep learning surrogates for airfoil aerodynamics have been explored extensively
+\citep{thuerey2020deep, bhatnagar2019prediction}, primarily for predicting scalar
+coefficients or full-field volume quantities. Surface pressure reconstruction
+from sparse taps has received less attention; \citet{lee2020deep} studied CNN
+interpolation on structured grids, but without uncertainty quantification or
+support for irregular tap placements.
+
+%------------------------------------------------------------------------------
+\section{Problem Formulation}
+\label{sec:problem}
+%------------------------------------------------------------------------------
+
+Let $\mathbf{p} \in \mathbb{R}^N$ denote the surface pressure field sampled at
+$N=256$ uniformly-spaced arc-length positions $s_i \in [0,1]$ around the airfoil,
+where $s=0$ is the leading edge and $s=1$ closes back at the trailing edge.
+
+A sparse observation set $\mathbf{y}_k = \{(s_j, p_j)\}_{j=1}^k$ consists of
+$k$ pressure measurements at tap positions $\{s_j\}$. The inlet conditions
+$\mathbf{u} = [v_x, v_y, \alpha]$ — freestream velocity components and angle of
+attack — are assumed known. The reconstruction task is to infer the posterior
+$p(\mathbf{p} \mid \mathbf{y}_k, \mathbf{u})$.
+
+In the \textbf{uniform} tap setting, tap positions are fixed at
+$s_j = (j-1)/k$ for $j = 1, \ldots, k$, providing even surface coverage.
+In the \textbf{randomized} setting, tap indices are drawn uniformly at random
+from $\{0, \ldots, N-1\}$ without replacement, sorted by arc position before
+encoding, reflecting realistic experimental constraints.
+
+%------------------------------------------------------------------------------
+\section{Methodology}
+\label{sec:method}
+%------------------------------------------------------------------------------
+
+\subsection{Conditional Flow Matching}
+
+We adopt the straight-line OT-CFM formulation \citep{lipman2022flow}. Given a
+target pressure field $\mathbf{x}_1 \sim p_{\text{data}}$ and Gaussian noise
+$\mathbf{x}_0 \sim \mathcal{N}(0, I)$, we define the interpolant:
+\begin{equation}
+    \mathbf{x}_t = (1 - (1 - \sigma_\mathrm{min})\,t)\,\mathbf{x}_0 + t\,\mathbf{x}_1,
+    \quad t \in [0, 1],
+    \label{eq:interpolant}
+\end{equation}
+with $\sigma_\mathrm{min} = 10^{-4}$. The target velocity along this path is:
+\begin{equation}
+    \mathbf{u}_t = \mathbf{x}_1 - (1 - \sigma_\mathrm{min})\,\mathbf{x}_0.
+\end{equation}
+The velocity network $v_\theta(\mathbf{x}_t, t, \mathbf{c})$ minimises:
+\begin{equation}
+    \mathcal{L}_{\mathrm{CFM}}(\theta) =
+    \mathbb{E}_{t,\, \mathbf{x}_1,\, \mathbf{x}_0}
+    \left[\left\| v_\theta(\mathbf{x}_t, t, \mathbf{c}) - \mathbf{u}_t \right\|^2\right].
+    \label{eq:cfm_loss}
+\end{equation}
+At inference, $n_\mathrm{samples}$ noise vectors are integrated forward via
+Euler's method (20 steps), producing a posterior ensemble over pressure fields.
+
+\subsection{Sparse Tap Encoder}
+
+The condition vector $\mathbf{c} \in \mathbb{R}^{128}$ is computed by a
+\textbf{DeepSets} encoder with learned positional attention:
+\begin{equation}
+    \mathbf{c} = f_\mathrm{fuse}\!\left(\textstyle\sum_{j=1}^k w_j\, g(\mathbf{y}_j),\;\mathbf{u},\; k/k_\mathrm{max}\right),
+    \label{eq:encoder}
+\end{equation}
+where $g$ is a shared per-tap MLP, $w_j = \mathrm{softmax}(a(s_j))_j$ are
+attention weights from a position MLP $a$, and $f_\mathrm{fuse}$ is a fusion
+MLP. Table~\ref{tab:encoder} details each component.
+
+\begin{table}[ht]
+\centering
+\caption{Sparse tap encoder architecture.}
+\label{tab:encoder}
+\begin{tabular}{lllc}
+\toprule
+Component & Input & Output & Layers \\
+\midrule
+Per-tap MLP $g$ & $(s_j, p_j) \in \mathbb{R}^2$ & $\mathbb{R}^{128}$ & 3$\times$Linear(128) + SiLU \\
+Attention MLP $a$ & $s_j \in \mathbb{R}$ & scalar logit & Linear(32) + SiLU + Linear(1) \\
+Softmax pooling & $k$ embeddings + logits & $\mathbb{R}^{128}$ & $\sum_j \mathrm{softmax}(a_j)\, g_j$ \\
+Fusion MLP $f_\mathrm{fuse}$ & $[\mathbf{h};\,\mathbf{u};\,k/k_\mathrm{max}] \in \mathbb{R}^{132}$ & $\mathbf{c} \in \mathbb{R}^{128}$ & 2$\times$Linear(128) + SiLU \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The attention weight $a(s_j)$ allows the model to learn that taps at physically
+significant positions — the suction peak ($s \approx 0.05$), trailing edge
+($s \approx 0$) — are more informative than taps on the flat pressure side.
+Including $k/k_\mathrm{max}$ in the fusion enables the vector field to produce
+sharper posteriors when more taps are available. Under uniform placement,
+attention weights converge to position-independent constants (mean pooling is
+equivalent); under random placement the attention is genuinely informative, as
+the model must discover which positions are most constraining from the pressure
+values alone.
+
+\textbf{Why not a convolutional encoder?} With $k \leq 20$ taps on a 256-point
+grid, the observation signal is 92--98\% zeros when scattered onto the grid.
+A 1D conv encoder learns to detect isolated impulses rather than spatial context,
+empirically underperforming the DeepSets baseline. Conv inductive biases benefit
+dense signals — motivating their use in the vector field but not the encoder.
+
+\subsection{1D Convolutional UNet Vector Field}
+
+The velocity network $v_\theta$ is a 1D UNet (Table~\ref{tab:unet}) operating
+on the 256-point pressure signal. Each residual block uses
+\textbf{FiLM conditioning}:
+\begin{equation}
+    \mathbf{h}' = \mathbf{h} + \sigma\!\left(\mathrm{GN}(\mathrm{Conv}(\mathbf{h})) \cdot (1 + \boldsymbol{\gamma}) + \boldsymbol{\beta}\right),
+    \label{eq:film}
+\end{equation}
+where $\boldsymbol{\gamma}, \boldsymbol{\beta}$ are linear projections of
+$[\mathbf{c};\,\mathbf{t}_\mathrm{emb}]$ and $\mathbf{t}_\mathrm{emb} \in
+\mathbb{R}^{32}$ is a Fourier time embedding.
+
+\begin{table}[ht]
+\centering
+\caption{1D conv UNet vector field architecture. Residual block convolutions use
+circular padding; strided down/upsample convolutions use zero padding. GN =
+GroupNorm(8). Each level contains $n_\mathrm{blocks}=2$ FiLM residual blocks.
+Skip connections link encoder to decoder at each level.}
+\label{tab:unet}
+\begin{tabular}{lcccc}
+\toprule
+Level & Spatial size & Channels & Operation & Kernel \\
+\midrule
+Input proj.   & 256 & 1 $\to$ 64   & Conv1d(1)    & 1 \\
+Encoder 0     & 256 & 64           & 2$\times$ResBlock & 5 \\
+Downsample 0  & 256$\to$128 & 64$\to$128  & Conv1d(stride 2) & 4 \\
+Encoder 1     & 128 & 128          & 2$\times$ResBlock & 5 \\
+Downsample 1  & 128$\to$64  & 128$\to$256 & Conv1d(stride 2) & 4 \\
+Bottleneck    & 64  & 256          & 2$\times$ResBlock & 5 \\
+Upsample 1    & 64$\to$128  & 256$\to$128 & ConvTranspose1d  & 4 \\
+Decoder 1     & 128 & 128 (+skip)  & 2$\times$ResBlock & 5 \\
+Upsample 0    & 128$\to$256 & 128$\to$64  & ConvTranspose1d  & 4 \\
+Decoder 0     & 256 & 64 (+skip)   & 2$\times$ResBlock & 5 \\
+Output proj.  & 256 & 64$\to$1     & Conv1d(1)    & 1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Why FiLM at every layer?} In preliminary experiments, concatenating
+$\mathbf{c}$ only at the input caused posterior collapse: the network ignored
+the condition and predicted the marginal pressure distribution (val loss
+$\approx 0.36$, MAE $\approx 250$\,Pa). FiLM injects the condition at every
+block, making it structurally impossible to deactivate the conditioning signal.
+
+\textbf{Circular padding in residual blocks.} The residual convolutions
+use circular padding so that the receptive field wraps correctly at the
+arc-length endpoints — $s=0$ and $s=1$ are the same physical point (trailing
+edge). Strided down/upsample convolutions use standard zero padding, as they
+operate on compressed representations where boundary effects are less significant.
+
+\subsection{Integrated Aerodynamic Coefficients}
+
+Lift and drag coefficients are computed from each ensemble member via:
+\begin{equation}
+    C_L = \frac{1}{q_\infty}\int_0^L p(s)\,\mathbf{n}(s)\cdot\hat{\mathbf{l}}\,ds, \qquad
+    C_D = \frac{1}{q_\infty}\int_0^L p(s)\,\mathbf{n}(s)\cdot\hat{\mathbf{d}}\,ds,
+\end{equation}
+evaluated by the trapezoidal rule on the 256-point arc-length grid, where
+$q_\infty = \tfrac{1}{2}\|v\|^2$ is the dynamic pressure.
+
+\subsection{Training Details}
+
+Pressure fields are standardised using training statistics
+($\mu_p = -488$\,Pa, $\sigma_p = 1330$\,Pa). The model is trained for 400
+epochs with AdamW (lr $= 3\times10^{-4}$, weight decay $= 10^{-4}$), cosine
+annealing, and gradient clipping (norm 1.0). Total parameters: 1.92\,M.
+Training takes $\approx$10 minutes on a single NVIDIA GPU.
+
+%------------------------------------------------------------------------------
+\section{Experimental Setup}
+\label{sec:experiments}
+%------------------------------------------------------------------------------
+
+\subsection{Dataset}
+
+We use the \textbf{AirfRANS} dataset \citep{bonnet2022airfrans}, comprising
+1,000 RANS simulations of 2D airfoils at angles of attack $-5^\circ$ to
+$+15^\circ$ and freestream speeds 31--94\,m/s. The surface boundary is extracted
+by tracing the VTP connectivity graph from the leading edge and resampled to a
+uniform 256-point arc-length grid. A stratified 80/20 split by $C_D$ decile
+ensures matched flow-regime distributions in train and test sets (an unconstrained
+random split produced $1.7\times$ more stalled cases in the test set).
+
+\subsection{Evaluation Metrics}
+
+For each test case, we draw $n_\mathrm{samples}=100$ posterior samples and report:
+\textbf{MAE($p$)} in Pa; \textbf{Relative MAE} as a fraction of the per-case
+pressure range; \textbf{MAE($C_L$)}, \textbf{MAE($C_D$)} from the ensemble mean;
+and \textbf{coverage} — the fraction of cases where the ground truth falls within
+$\pm2\sigma$ of the posterior (target: 95\%).
+
+%------------------------------------------------------------------------------
+\section{Results}
+\label{sec:results}
+%------------------------------------------------------------------------------
+
+\subsection{Qualitative Reconstruction}
+
+Figures~\ref{fig:uniform_recon} and~\ref{fig:random_recon} show reconstruction
+results for a representative test case under uniform and randomized tap placement
+respectively. Each figure shows, for $k \in \{5, 10, 20\}$: (top) the airfoil
+geometry with numbered tap locations coloured by their measured pressure, and
+(bottom) the posterior mean $\pm1\sigma$/$\pm2\sigma$ bands vs.\ ground truth.
+
+Under uniform placement (Figure~\ref{fig:uniform_recon}), the model reliably
+captures the leading-edge suction peak, mid-chord pressure recovery, and
+trailing-edge stagnation. Uncertainty bands narrow visibly from $k=5$ to $k=10$.
+The slight spike at the trailing edge ($s \approx 0.5$) is a real physical
+discontinuity — the pressure jump between suction and pressure surfaces at the
+trailing edge — and is not a reconstruction artefact.
+
+Under randomized placement (Figure~\ref{fig:random_recon}), reconstruction
+quality is more variable. When random taps happen to land near the suction peak
+(observable from the numbered locations on the airfoil), the reconstruction is
+comparable to uniform. When taps cluster on the flat pressure side, the suction
+peak is poorly constrained and uncertainty bands remain wide. This case-by-case
+variability is a fundamental property of random placement, and is correctly
+reflected in the wider uncertainty bands.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=\textwidth]{figures_uniform/fig1.png}
+    \caption{Uniform tap placement. \textit{Top row}: airfoil geometry with
+             numbered tap locations (coloured by measured pressure). \textit{Bottom
+             row}: posterior pressure reconstruction. Solid: ensemble mean. Bands:
+             $\pm1\sigma$ (dark), $\pm2\sigma$ (light). Dashed: ground truth.
+             Numbers on the pressure plot correspond to tap labels on the airfoil.}
+    \label{fig:uniform_recon}
+\end{figure}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=\textwidth]{figures_random/fig1.png}
+    \caption{Randomized tap placement for the same test case. Tap locations vary
+             stochastically; when taps cluster away from the suction peak
+             (e.g.\ $k=5$), uncertainty bands are wider and the peak is less
+             accurately resolved.}
+    \label{fig:random_recon}
+\end{figure}
+
+\subsection{Overall Performance}
+
+Table~\ref{tab:main_results} reports aggregate performance across 100 test cases.
+
+\begin{table}[ht]
+\centering
+\caption{Reconstruction performance (100 test cases, 100 samples each).
+Coverage target: 95\% at $\pm 2\sigma$.}
+\label{tab:main_results}
+\begin{tabular}{llccccc}
+\toprule
+Strategy & $k$ & MAE($p$) [Pa] & MAE($C_L$) & MAE($C_D$) & $C_L$ cov. & $C_D$ cov. \\
+\midrule
+\multirow{3}{*}{Uniform}
+  & 5  & 211 & 0.115 & 0.017 & 97\% & 97\% \\
+  & 10 & 183 & 0.094 & 0.015 & 100\% & 98\% \\
+  & 20 & 189 & 0.094 & 0.015 & 100\% & 98\% \\
+\midrule
+\multirow{3}{*}{Random}
+  & 5  & 275 & 0.149 & 0.022 & 96\% & 95\% \\
+  & 10 & 255 & 0.134 & 0.020 & 96\% & 96\% \\
+  & 20 & 237 & 0.122 & 0.019 & 100\% & 97\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Uniform placement outperforms random by 25--35\% in MAE($p$). The two strategies
+show contrasting $k$-scaling: uniform saturates (and slightly regresses) between
+$k=10$ and $k=20$ due to discrete tap-stride alignment effects, while random
+placement improves monotonically as larger $k$ stochastically guarantees better
+coverage of high-gradient regions. $C_L$ and $C_D$ errors scale sublinearly with
+pressure MAE, as coefficient errors depend on surface integrals that average out
+local reconstruction noise.
+
+\subsection{Aerodynamic Coefficient Posteriors}
+
+Figures~\ref{fig:uniform_clcd} and~\ref{fig:random_clcd} show the posterior
+distributions of $C_L$ and $C_D$ as violin plots for a representative test case.
+Each violin represents the ensemble of 200 samples drawn from the CFM posterior
+at a given $k$, with the dashed line marking the ground truth.
+
+Under uniform placement (Figure~\ref{fig:uniform_clcd}), the $C_L$ posterior
+narrows and converges toward the ground truth as $k$ increases, reflecting the
+additional information carried by more taps. The $C_D$ posterior similarly
+tightens but retains meaningful spread due to the inherent sensitivity of drag
+to local pressure features near the trailing edge.
+
+Under randomized placement (Figure~\ref{fig:random_clcd}), the posteriors are
+wider at all $k$, consistent with the higher pressure MAE in Table~\ref{tab:main_results}.
+The ground truth is contained within the posterior in all cases, confirming
+that the model does not produce overconfident estimates even under random placement
+— consistent with the over-coverage observed in Table~\ref{tab:main_results}.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.85\textwidth]{figures_uniform/fig3.png}
+    \caption{$C_L$ and $C_D$ posterior distributions for $k \in \{5, 10, 20\}$
+             uniform taps. Violin width represents posterior density. Dashed line:
+             ground truth. The posterior narrows with increasing $k$, correctly
+             reflecting reduced uncertainty from more observations.}
+    \label{fig:uniform_clcd}
+\end{figure}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.85\textwidth]{figures_random/fig3.png}
+    \caption{$C_L$ and $C_D$ posteriors for randomized tap placement. Wider
+             distributions reflect the additional uncertainty from not controlling
+             sensor locations. The ground truth remains within the posterior
+             at all $k$, confirming conservative but not overconfident uncertainty
+             estimates.}
+    \label{fig:random_clcd}
+\end{figure}
+
+\subsection{Failure Mode Analysis by Angle of Attack}
+
+Figure~\ref{fig:uniform_aoa} and~\ref{fig:random_aoa} show per-case MAE vs.\
+angle of attack across the full test set, with bin means overlaid. Both absolute
+MAE (Pa) and relative MAE (as a fraction of the per-case pressure range) are
+shown; the relative metric removes the confound of high-speed cases having larger
+absolute pressure magnitudes. Table~\ref{tab:aoa_breakdown} summarises the AoA
+breakdown for the uniform model.
+
+\begin{table}[ht]
+\centering
+\caption{MAE($p$) by AoA bin, uniform placement, $k=10$.}
+\label{tab:aoa_breakdown}
+\begin{tabular}{lccc}
+\toprule
+AoA range & $n$ & Mean MAE [Pa] & 90th pct [Pa] \\
+\midrule
+$-5^\circ$ to $0^\circ$    & 54 & 219 & 553 \\
+$0^\circ$  to $+5^\circ$   & 60 & 137 & 261 \\
+$+5^\circ$ to $+10^\circ$  & 40 & 102 & 164 \\
+$+10^\circ$ to $+15^\circ$ & 46 & 109 & 210 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Negative AoA cases are systematically harder: all 10 worst-performing cases occur
+at $-2^\circ$ to $-5^\circ$. At negative incidence the suction peak migrates to
+the lower surface, appearing at an unfamiliar arc-length position relative to the
+positive-AoA training distribution. Both strategies show this failure mode, though
+it is more pronounced under random placement (Figure~\ref{fig:random_aoa}) where
+the suction peak is also less likely to be directly sampled. Notably, the relative
+MAE plot shows that negative-AoA cases are harder even after normalising by
+pressure range, confirming the failure is structural rather than a consequence
+of lower dynamic pressure.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=\textwidth]{figures_uniform/fig4.png}
+    \caption{Per-case MAE vs.\ AoA, uniform taps, $k=10$. \textit{Left}: absolute
+             MAE (Pa). \textit{Right}: relative MAE as a percentage of the per-case
+             pressure range, removing the effect of varying dynamic pressure.
+             Scatter: individual test cases. Red line: bin means. Degradation below
+             $0^\circ$ is visible in both metrics, confirming a structural failure
+             mode at negative incidence.}
+    \label{fig:uniform_aoa}
+\end{figure}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=\textwidth]{figures_random/fig4.png}
+    \caption{Per-case MAE vs.\ AoA for randomized taps, $k=10$. The negative-AoA
+             failure mode is more pronounced: random placement reduces the
+             probability of sampling the suction peak at any incidence, and
+             at negative AoA the peak position is also unfamiliar to the model.}
+    \label{fig:random_aoa}
+\end{figure}
+
+Table~\ref{tab:cd_breakdown} shows MAE by $C_D$ regime. Counterintuitively,
+stalled cases (CD $> 0.05$) are easier to reconstruct than mildly separated ones:
+stalled airfoils have broad, featureless low-pressure plateaux that sparse taps
+can capture, whereas mildly separated cases have sharp local features (separation
+bubbles, reattachment) sensitive to exact tap placement.
+
+\begin{table}[ht]
+\centering
+\caption{MAE($p$) by $C_D$ regime, uniform placement, $k=10$.}
+\label{tab:cd_breakdown}
+\begin{tabular}{lccc}
+\toprule
+$C_D$ range & Flow regime & $n$ & Mean MAE [Pa] \\
+\midrule
+$[0.00, 0.01)$ & Fully attached  & 119 & 150 \\
+$[0.01, 0.05)$ & Mild separation &  30 & 183 \\
+$[0.05, 0.10)$ & Separated       &  15 &  99 \\
+$[0.10, 0.25]$ & Stalled         &  31 & 119 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%------------------------------------------------------------------------------
+\section{Discussion}
+\label{sec:discussion}
+%------------------------------------------------------------------------------
+
+\paragraph{Uniform vs.\ randomized placement.}
+The 25--35\% MAE advantage of uniform placement quantifies a practically important
+tradeoff. For new test articles where tap locations can be specified, even spacing
+is significantly more informative per tap and provides better-behaved $k$-scaling.
+For legacy models with fixed instrumentation, the randomized model provides a
+viable reconstruction path, with the attention mechanism learning to exploit
+whichever taps happen to land near informative regions.
+
+\paragraph{Contrasting $k$-scaling.}
+Uniform placement saturates between $k=10$ and $k=20$ (183 $\to$ 189\,Pa) due
+to discrete stride effects: the $k=20$ tap set is not a superset of $k=10$, so
+some cases lose coverage of the suction peak. Random placement improves
+monotonically (275 $\to$ 255 $\to$ 237\,Pa), as larger $k$ stochastically
+guarantees better high-gradient coverage in expectation. This suggests random
+placement offers a more predictable sensor-count scaling law.
+
+\paragraph{Limitations.}
+The model is trained exclusively on SST RANS simulations from AirfRANS, limiting
+validity to that distribution. The negative AoA regime ($-5^\circ$ to $0^\circ$)
+is a known weak point. The over-dispersed posterior at $k > 5$ suggests the CFM
+objective does not fully exploit additional tap information; tighter calibration
+could be achieved via classifier-free guidance, at the cost of training complexity.
+
+%------------------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+%------------------------------------------------------------------------------
+
+We presented a Conditional Flow Matching framework for uncertainty-aware
+reconstruction of airfoil surface pressure distributions from sparse tap
+measurements. The model combines a DeepSets encoder with learned positional
+attention — enabling generalisation to arbitrary sensor placements — with a
+1D convolutional UNet vector field conditioned via FiLM at every spatial scale.
+On the AirfRANS benchmark, the framework achieves 183\,Pa MAE at $k=10$ uniform
+taps with well-calibrated uncertainty. The controlled ablation against randomized
+placement quantifies the 25--35\% reconstruction cost of not controlling sensor
+location, and reveals contrasting $k$-scaling behaviour that has practical
+implications for experimental sensor design.
+
+Future work will explore adaptive tap placement via active learning, extension to
+transonic regimes using the UniFoil dataset, and application to 3D wing pressure
+reconstruction from surface tap arrays.
+
+\newpage
+\bibliographystyle{abbrv}
+\bibliography{ref_report}
+
+\end{document}

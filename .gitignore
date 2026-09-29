@@ -1,0 +1,13 @@
+# Model checkpoints (134 MB) — regenerate with train.py
+checkpoints_uniform/
+checkpoints_random/
+
+# Preprocessed AirfRANS arrays — regenerate with data/preprocess.py
+processed/
+
+# Raw evaluation dump
+results/eval_results.npy
+
+__pycache__/
+*.pyc
+.DS_Store
